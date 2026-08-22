@@ -1,0 +1,11 @@
+.git/
+node_modules/
+.env
+.env.*
+*.log
+*.pem
+
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/.terraform.lock.hcl
