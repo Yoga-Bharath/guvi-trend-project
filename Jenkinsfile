@@ -2,11 +2,9 @@ pipeline {
     agent any
 
     environment {
-        AWS_REGION = 'ap-south-1'
-        AWS_ACCOUNT_ID = '822127610519'
-        ECR_REPOSITORY = 'trend-app'
-        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-        IMAGE_NAME = "${ECR_REGISTRY}/${ECR_REPOSITORY}"
+        DOCKERHUB_REPOSITORY = 'yogabharath/guvi-trend-app'
+        IMAGE_TAG = 'latest'
+        KUBECONFIG = '/var/lib/jenkins/.kube/config'
     }
 
     stages {
@@ -20,36 +18,97 @@ pipeline {
         stage('Build Docker Image') {
             steps {
                 sh '''
-                    docker build -t ${ECR_REPOSITORY}:latest .
+                    docker build \
+                      -t ${DOCKERHUB_REPOSITORY}:${IMAGE_TAG} \
+                      .
                 '''
             }
         }
 
-        stage('Login to ECR') {
+        stage('Test Docker Image') {
             steps {
                 sh '''
-                    aws ecr get-login-password --region ${AWS_REGION} | \
-                    docker login \
-                    --username AWS \
-                    --password-stdin ${ECR_REGISTRY}
+                    docker run -d \
+                      --name trend-ci-test \
+                      -p 3000:3000 \
+                      ${DOCKERHUB_REPOSITORY}:${IMAGE_TAG}
+
+                    sleep 5
+
+                    echo "===== TESTING APPLICATION ====="
+
+                    curl -f http://localhost:3000
+
+                    echo ""
+                    echo "===== APPLICATION TEST PASSED ====="
+
+                    docker stop trend-ci-test
+                    docker rm trend-ci-test
                 '''
             }
         }
 
-        stage('Tag Docker Image') {
+        stage('Login to DockerHub') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-trend',
+                        usernameVariable: 'DOCKERHUB_USERNAME',
+                        passwordVariable: 'DOCKERHUB_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        echo "${DOCKERHUB_TOKEN}" | \
+                        docker login \
+                        --username "${DOCKERHUB_USERNAME}" \
+                        --password-stdin
+                    '''
+                }
+            }
+        }
+
+        stage('Push to DockerHub') {
             steps {
                 sh '''
-                    docker tag \
-                    ${ECR_REPOSITORY}:latest \
-                    ${IMAGE_NAME}:latest
+                    docker push ${DOCKERHUB_REPOSITORY}:${IMAGE_TAG}
                 '''
             }
         }
 
-        stage('Push to ECR') {
+        stage('Deploy to EKS') {
             steps {
                 sh '''
-                    docker push ${IMAGE_NAME}:latest
+                    kubectl apply \
+                      -f kubernetes-manifests/deployment.yaml \
+                      --kubeconfig ${KUBECONFIG}
+
+                    kubectl apply \
+                      -f kubernetes-manifests/service.yaml \
+                      --kubeconfig ${KUBECONFIG}
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                sh '''
+                    echo "===== ROLLOUT STATUS ====="
+
+                    kubectl rollout status \
+                      deployment/trend-app \
+                      --kubeconfig ${KUBECONFIG} \
+                      --timeout=180s
+
+                    echo "===== PODS ====="
+
+                    kubectl get pods \
+                      -o wide \
+                      --kubeconfig ${KUBECONFIG}
+
+                    echo "===== SERVICE ====="
+
+                    kubectl get service trend-service \
+                      --kubeconfig ${KUBECONFIG}
                 '''
             }
         }
@@ -57,11 +116,18 @@ pipeline {
 
     post {
         success {
-            echo 'Trend application image successfully pushed to ECR.'
+            echo 'Trend application successfully built, tested, pushed to DockerHub, and deployed to EKS.'
         }
 
         failure {
             echo 'Trend application pipeline failed.'
+        }
+
+        always {
+            sh '''
+                docker rm -f trend-ci-test 2>/dev/null || true
+                docker logout || true
+            '''
         }
     }
 }
