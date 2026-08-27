@@ -4,17 +4,25 @@ pipeline {
     environment {
         DOCKERHUB_REPOSITORY = 'yogabharath/guvi-trend-app'
         KUBECONFIG = '/var/lib/jenkins/.kube/config'
+        AWS_REGION = 'ap-south-1'
+        EKS_CLUSTER = 'trend-cluster'
     }
 
     stages {
 
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
         stage('Set Image Tag') {
             steps {
                 script {
-                    IMAGE_TAG = "${BUILD_NUMBER}"
-                    env.IMAGE_TAG = IMAGE_TAG
+                    env.IMAGE_TAG = "${BUILD_NUMBER}"
+                    env.IMAGE_NAME = "${DOCKERHUB_REPOSITORY}:${IMAGE_TAG}"
 
-                    echo "Docker Image: ${DOCKERHUB_REPOSITORY}:${IMAGE_TAG}"
+                    echo "Docker Image: ${IMAGE_NAME}"
                 }
             }
         }
@@ -25,7 +33,7 @@ pipeline {
                     echo "===== BUILDING DOCKER IMAGE ====="
 
                     docker build \
-                      -t ${DOCKERHUB_REPOSITORY}:${IMAGE_TAG} \
+                      -t ${IMAGE_NAME} \
                       .
                 '''
             }
@@ -36,10 +44,12 @@ pipeline {
                 sh '''
                     echo "===== STARTING TEST CONTAINER ====="
 
+                    docker rm -f trend-ci-test 2>/dev/null || true
+
                     docker run -d \
                       --name trend-ci-test \
                       -p 3000:3000 \
-                      ${DOCKERHUB_REPOSITORY}:${IMAGE_TAG}
+                      ${IMAGE_NAME}
 
                     sleep 5
 
@@ -70,8 +80,8 @@ pipeline {
 
                         echo "${DOCKERHUB_TOKEN}" | \
                         docker login \
-                          --username "${DOCKERHUB_USERNAME}" \
-                          --password-stdin
+                        --username "${DOCKERHUB_USERNAME}" \
+                        --password-stdin
                     '''
                 }
             }
@@ -82,8 +92,7 @@ pipeline {
                 sh '''
                     echo "===== PUSHING IMAGE TO DOCKERHUB ====="
 
-                    docker push \
-                      ${DOCKERHUB_REPOSITORY}:${IMAGE_TAG}
+                    docker push ${IMAGE_NAME}
                 '''
             }
         }
@@ -93,9 +102,11 @@ pipeline {
                 sh '''
                     echo "===== CONFIGURING EKS ====="
 
+                    mkdir -p /var/lib/jenkins/.kube
+
                     aws eks update-kubeconfig \
-                      --region ap-south-1 \
-                      --name trend-cluster \
+                      --region ${AWS_REGION} \
+                      --name ${EKS_CLUSTER} \
                       --kubeconfig ${KUBECONFIG}
 
                     echo "===== VERIFYING EKS ACCESS ====="
@@ -113,16 +124,28 @@ pipeline {
 
                     ls -la kubernetes-manifests/
 
+                    echo "===== APPLYING SERVICE ====="
+
+                    kubectl apply \
+                      -f kubernetes-manifests/service.yaml \
+                      --kubeconfig ${KUBECONFIG}
+
                     echo "===== APPLYING DEPLOYMENT ====="
 
                     kubectl apply \
                       -f kubernetes-manifests/deployment.yaml \
                       --kubeconfig ${KUBECONFIG}
 
-                    echo "===== APPLYING SERVICE ====="
+                    echo "===== UPDATING DEPLOYMENT IMAGE ====="
 
-                    kubectl apply \
-                      -f kubernetes-manifests/service.yaml \
+                    kubectl set image \
+                      deployment/trend-app \
+                      trend-app=${IMAGE_NAME} \
+                      --kubeconfig ${KUBECONFIG}
+
+                    echo "===== IMAGE UPDATED ====="
+
+                    kubectl get deployment trend-app \
                       --kubeconfig ${KUBECONFIG}
                 '''
             }
@@ -138,29 +161,57 @@ pipeline {
                       --kubeconfig ${KUBECONFIG} \
                       --timeout=180s
 
+                    echo "===== DEPLOYMENT STATUS ====="
+
+                    kubectl get deployment trend-app \
+                      -o wide \
+                      --kubeconfig ${KUBECONFIG}
+
                     echo "===== PODS ====="
 
                     kubectl get pods \
                       -o wide \
                       --kubeconfig ${KUBECONFIG}
 
-                    echo "===== DEPLOYMENT ====="
-
-                    kubectl get deployment trend-app \
-                      --kubeconfig ${KUBECONFIG}
-
                     echo "===== SERVICE ====="
 
                     kubectl get service trend-service \
                       --kubeconfig ${KUBECONFIG}
+                '''
+            }
+        }
 
-                    echo "===== APPLICATION LOAD BALANCER ====="
+        stage('Test EKS Application') {
+            steps {
+                sh '''
+                    echo "===== GETTING LOAD BALANCER ====="
 
-                    kubectl get service trend-service \
-                      -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' \
-                      --kubeconfig ${KUBECONFIG}
+                    LB_HOST=$(kubectl get svc trend-service \
+                      --kubeconfig ${KUBECONFIG} \
+                      -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
 
-                    echo ""
+                    echo "Load Balancer: ${LB_HOST}"
+
+                    echo "===== WAITING FOR LOAD BALANCER ====="
+
+                    for i in {1..30}; do
+                        if curl -f --connect-timeout 5 \
+                          http://${LB_HOST}:3000 > /dev/null 2>&1; then
+
+                            echo "===== EKS APPLICATION TEST PASSED ====="
+
+                            echo "Application URL:"
+                            echo "http://${LB_HOST}:3000"
+
+                            exit 0
+                        fi
+
+                        echo "Waiting for application..."
+                        sleep 10
+                    done
+
+                    echo "===== EKS APPLICATION TEST FAILED ====="
+                    exit 1
                 '''
             }
         }
@@ -169,6 +220,7 @@ pipeline {
     post {
         success {
             echo 'Trend CI/CD pipeline completed successfully.'
+            echo "Docker Image: ${IMAGE_NAME}"
         }
 
         failure {
