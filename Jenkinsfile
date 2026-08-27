@@ -20,9 +20,9 @@ pipeline {
             steps {
                 script {
                     env.IMAGE_TAG = "${BUILD_NUMBER}"
-                    env.IMAGE_NAME = "${DOCKERHUB_REPOSITORY}:${IMAGE_TAG}"
+                    env.IMAGE_NAME = "${env.DOCKERHUB_REPOSITORY}:${env.IMAGE_TAG}"
 
-                    echo "Docker Image: ${IMAGE_NAME}"
+                    echo "Docker Image: ${env.IMAGE_NAME}"
                 }
             }
         }
@@ -192,10 +192,18 @@ pipeline {
 
                     echo "Load Balancer: ${LB_HOST}"
 
-                    echo "===== WAITING FOR LOAD BALANCER ====="
+                    if [ -z "$LB_HOST" ]; then
+                        echo "ERROR: Load Balancer hostname not available"
+                        exit 1
+                    fi
+
+                    echo "===== TESTING EKS APPLICATION ====="
 
                     for i in {1..30}; do
-                        if curl -f --connect-timeout 5 \
+
+                        if curl -f \
+                          --connect-timeout 5 \
+                          --max-time 10 \
                           http://${LB_HOST}:3000 > /dev/null 2>&1; then
 
                             echo "===== EKS APPLICATION TEST PASSED ====="
@@ -206,7 +214,7 @@ pipeline {
                             exit 0
                         fi
 
-                        echo "Waiting for application..."
+                        echo "Attempt $i/30: Application not ready..."
                         sleep 10
                     done
 
@@ -220,7 +228,7 @@ pipeline {
     post {
         success {
             echo 'Trend CI/CD pipeline completed successfully.'
-            echo "Docker Image: ${IMAGE_NAME}"
+            echo "Docker Image: ${env.IMAGE_NAME}"
         }
 
         failure {
