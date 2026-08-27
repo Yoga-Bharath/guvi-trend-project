@@ -3,28 +3,18 @@ pipeline {
 
     environment {
         DOCKERHUB_REPOSITORY = 'yogabharath/guvi-trend-app'
-
-        AWS_REGION = 'ap-south-1'
-        EKS_CLUSTER = 'trend-cluster'
-
         KUBECONFIG = '/var/lib/jenkins/.kube/config'
     }
 
     stages {
 
-        stage('Checkout') {
-            steps {
-                checkout scm
-            }
-        }
-
         stage('Set Image Tag') {
             steps {
                 script {
-                    env.IMAGE_TAG = "${BUILD_NUMBER}"
-                    env.IMAGE_NAME = "${DOCKERHUB_REPOSITORY}:${IMAGE_TAG}"
+                    IMAGE_TAG = "${BUILD_NUMBER}"
+                    env.IMAGE_TAG = IMAGE_TAG
 
-                    echo "Docker Image: ${IMAGE_NAME}"
+                    echo "Docker Image: ${DOCKERHUB_REPOSITORY}:${IMAGE_TAG}"
                 }
             }
         }
@@ -32,8 +22,10 @@ pipeline {
         stage('Build Docker Image') {
             steps {
                 sh '''
+                    echo "===== BUILDING DOCKER IMAGE ====="
+
                     docker build \
-                      -t ${IMAGE_NAME} \
+                      -t ${DOCKERHUB_REPOSITORY}:${IMAGE_TAG} \
                       .
                 '''
             }
@@ -47,7 +39,7 @@ pipeline {
                     docker run -d \
                       --name trend-ci-test \
                       -p 3000:3000 \
-                      ${IMAGE_NAME}
+                      ${DOCKERHUB_REPOSITORY}:${IMAGE_TAG}
 
                     sleep 5
 
@@ -74,10 +66,12 @@ pipeline {
                     )
                 ]) {
                     sh '''
+                        echo "===== LOGIN TO DOCKERHUB ====="
+
                         echo "${DOCKERHUB_TOKEN}" | \
                         docker login \
-                        --username "${DOCKERHUB_USERNAME}" \
-                        --password-stdin
+                          --username "${DOCKERHUB_USERNAME}" \
+                          --password-stdin
                     '''
                 }
             }
@@ -88,7 +82,8 @@ pipeline {
                 sh '''
                     echo "===== PUSHING IMAGE TO DOCKERHUB ====="
 
-                    docker push ${IMAGE_NAME}
+                    docker push \
+                      ${DOCKERHUB_REPOSITORY}:${IMAGE_TAG}
                 '''
             }
         }
@@ -99,8 +94,13 @@ pipeline {
                     echo "===== CONFIGURING EKS ====="
 
                     aws eks update-kubeconfig \
-                      --region ${AWS_REGION} \
-                      --name ${EKS_CLUSTER} \
+                      --region ap-south-1 \
+                      --name trend-cluster \
+                      --kubeconfig ${KUBECONFIG}
+
+                    echo "===== VERIFYING EKS ACCESS ====="
+
+                    kubectl get nodes \
                       --kubeconfig ${KUBECONFIG}
                 '''
             }
@@ -109,16 +109,20 @@ pipeline {
         stage('Deploy to EKS') {
             steps {
                 sh '''
-                    echo "===== APPLYING KUBERNETES MANIFESTS ====="
+                    echo "===== CHECKING KUBERNETES MANIFESTS ====="
+
+                    ls -la kubernetes-manifests/
+
+                    echo "===== APPLYING DEPLOYMENT ====="
+
+                    kubectl apply \
+                      -f kubernetes-manifests/deployment.yaml \
+                      --kubeconfig ${KUBECONFIG}
+
+                    echo "===== APPLYING SERVICE ====="
 
                     kubectl apply \
                       -f kubernetes-manifests/service.yaml \
-                      --kubeconfig ${KUBECONFIG}
-
-                    echo "===== DEPLOYING IMAGE ${IMAGE_NAME} ====="
-
-                    kubectl set image deployment/trend-app \
-                      trend-app=${IMAGE_NAME} \
                       --kubeconfig ${KUBECONFIG}
                 '''
             }
@@ -127,17 +131,12 @@ pipeline {
         stage('Verify Deployment') {
             steps {
                 sh '''
-                    echo "===== ROLLOUT STATUS ====="
+                    echo "===== WAITING FOR DEPLOYMENT ====="
 
                     kubectl rollout status \
                       deployment/trend-app \
                       --kubeconfig ${KUBECONFIG} \
                       --timeout=180s
-
-                    echo "===== DEPLOYMENT ====="
-
-                    kubectl get deployment trend-app \
-                      --kubeconfig ${KUBECONFIG}
 
                     echo "===== PODS ====="
 
@@ -145,27 +144,31 @@ pipeline {
                       -o wide \
                       --kubeconfig ${KUBECONFIG}
 
+                    echo "===== DEPLOYMENT ====="
+
+                    kubectl get deployment trend-app \
+                      --kubeconfig ${KUBECONFIG}
+
                     echo "===== SERVICE ====="
 
                     kubectl get service trend-service \
                       --kubeconfig ${KUBECONFIG}
+
+                    echo "===== APPLICATION LOAD BALANCER ====="
+
+                    kubectl get service trend-service \
+                      -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' \
+                      --kubeconfig ${KUBECONFIG}
+
+                    echo ""
                 '''
             }
         }
     }
 
     post {
-
         success {
-            echo """
-            ==========================================
-            TREND APPLICATION DEPLOYMENT SUCCESSFUL
-            ==========================================
-            Docker Image: ${IMAGE_NAME}
-            EKS Cluster: ${EKS_CLUSTER}
-            Region: ${AWS_REGION}
-            ==========================================
-            """
+            echo 'Trend CI/CD pipeline completed successfully.'
         }
 
         failure {
